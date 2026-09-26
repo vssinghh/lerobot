@@ -55,7 +55,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
@@ -88,7 +88,7 @@ from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_proces
 from lerobot.processor import PolicyProcessorPipeline, bind_relative_anchor
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
-from lerobot.utils.eval_stats import success_summary
+from lerobot.utils.eval_stats import fisher_exact, success_summary
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
@@ -841,6 +841,7 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
             env_features=cfg.env.features if cfg.eval.recording else None,
             recording_repo_id=cfg.eval.recording_repo_id,
             recording_private=cfg.eval.recording_private,
+            run_control=cfg.eval.run_control,
         )
         logger.info("Overall Aggregated Metrics:")
         logger.info(info["overall"])
@@ -853,6 +854,17 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
             ci_low,
             ci_high,
         )
+        if cfg.eval.run_control and "pc_success_control" in info["overall"]:
+            ctrl_low, ctrl_high = info["overall"]["pc_success_control_ci95"]
+            logger.info(
+                "Control success rate %.1f%% (%d/%d episodes, 95%% Wilson interval %.1f%% to %.1f%%, Fisher p=%.4f)",
+                info["overall"]["pc_success_control"],
+                info["overall"]["n_success_control"],
+                info["overall"]["n_episodes_control"],
+                ctrl_low,
+                ctrl_high,
+                info["overall"]["fisher_p_value"],
+            )
 
         # Print per-suite stats
         for task_group, task_group_info in info.items():
@@ -991,14 +1003,52 @@ def run_one(
     return task_group, task_id, metrics
 
 
-def _task_info(task_group: str, task_id: int, metrics: dict) -> dict:
-    """One `per_task` entry: the raw per-episode metrics plus the task's success count and interval."""
+def _control_comparison_summary(
+    primary_successes: Sequence[bool | int | float],
+    control_successes: Sequence[bool | int | float],
+) -> dict[str, Any]:
+    """Compute control arm summary statistics and two-sided Fisher exact p-value against primary."""
+    prim = success_summary(primary_successes)
+    ctrl = success_summary(control_successes)
+    if prim["n_episodes"] > 0 and ctrl["n_episodes"] > 0:
+        p_val = fisher_exact(
+            prim["n_success"],
+            prim["n_episodes"],
+            ctrl["n_success"],
+            ctrl["n_episodes"],
+        )
+    else:
+        p_val = float("nan")
     return {
+        "n_episodes_control": ctrl["n_episodes"],
+        "n_success_control": ctrl["n_success"],
+        "pc_success_control": ctrl["pc_success"],
+        "pc_success_control_ci95": ctrl["pc_success_ci95"],
+        "fisher_p_value": p_val,
+    }
+
+
+def _task_info(
+    task_group: str,
+    task_id: int,
+    metrics: dict,
+    control_metrics: dict | None = None,
+) -> dict:
+    """One `per_task` entry: the raw per-episode metrics plus the task's success count and interval."""
+    info = {
         "task_group": task_group,
         "task_id": task_id,
         "metrics": metrics,
         **success_summary(metrics.get("successes") or []),
     }
+    if control_metrics is not None:
+        info.update(
+            _control_comparison_summary(
+                metrics.get("successes") or [],
+                control_metrics.get("successes") or [],
+            )
+        )
+    return info
 
 
 def eval_policy_all(
@@ -1019,6 +1069,9 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    run_control: bool = False,
+    control_env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
+    control_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1035,10 +1088,12 @@ def eval_policy_all(
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
+    group_ctrl_successes: dict[str, list[bool]] = defaultdict(list)
+    overall_ctrl_successes: list[bool] = []
     per_task_infos: list[dict] = []
 
     # small inline helper to accumulate one task's metrics into accumulators
-    def _accumulate_to(group: str, metrics: dict):
+    def _accumulate_to(group: str, metrics: dict, ctrl_metrics: dict | None = None):
         # metrics expected to contain 'sum_rewards', 'max_rewards', 'successes', optionally 'video_paths'
         # but eval_one may store per-episode lists; we assume metrics uses scalars averaged per task as before.
         # To be robust, accept scalars or lists.
@@ -1060,6 +1115,14 @@ def eval_policy_all(
             if paths:
                 group_acc[group][key].extend(paths)
                 overall[key].extend(paths)
+        if ctrl_metrics is not None:
+            ctrl_succ = ctrl_metrics.get("successes") or []
+            if isinstance(ctrl_succ, list):
+                group_ctrl_successes[group].extend(ctrl_succ)
+                overall_ctrl_successes.extend(ctrl_succ)
+            else:
+                group_ctrl_successes[group].append(bool(ctrl_succ))
+                overall_ctrl_successes.append(bool(ctrl_succ))
 
     # Choose runner (sequential vs threaded)
     task_runner = partial(
@@ -1080,6 +1143,41 @@ def eval_policy_all(
         recording_private=recording_private,
     )
 
+    resolved_ctrl_env_prep = (
+        control_env_preprocessor
+        if control_env_preprocessor is not None
+        else (PolicyProcessorPipeline(steps=[]) if env_preprocessor is not None else None)
+    )
+    resolved_ctrl_prep = control_preprocessor if control_preprocessor is not None else preprocessor
+    control_runner = (
+        partial(
+            run_one,
+            policy=policy,
+            env_preprocessor=resolved_ctrl_env_prep,
+            env_postprocessor=env_postprocessor,
+            preprocessor=resolved_ctrl_prep,
+            postprocessor=postprocessor,
+            n_episodes=n_episodes,
+            max_episodes_rendered=0,
+            videos_dir=None,
+            return_episode_data=return_episode_data,
+            start_seed=start_seed,
+            recording_dir=None,
+            env_features=None,
+            recording_repo_id=None,
+            recording_private=False,
+        )
+        if run_control
+        else None
+    )
+
+    def _run_task_with_optional_control(task_group: str, task_id: int, env):
+        tg, tid, metrics = task_runner(task_group, task_id, env)
+        ctrl_metrics = None
+        if control_runner is not None:
+            _, _, ctrl_metrics = control_runner(task_group, task_id, env)
+        return tg, tid, metrics, ctrl_metrics
+
     # Set the shared policy's mode before launching any workers. Restoring it
     # inside individual tasks would let one task enable training mode while
     # another task is still evaluating.
@@ -1094,9 +1192,9 @@ def eval_policy_all(
                     prefetch_thread = None
 
                 try:
-                    tg, tid, metrics = task_runner(task_group, task_id, env)
-                    _accumulate_to(tg, metrics)
-                    per_task_infos.append(_task_info(tg, tid, metrics))
+                    tg, tid, metrics, ctrl_metrics = _run_task_with_optional_control(task_group, task_id, env)
+                    _accumulate_to(tg, metrics, ctrl_metrics)
+                    per_task_infos.append(_task_info(tg, tid, metrics, ctrl_metrics))
                 finally:
                     env.close()
                     # Prefetch next task's workers *after* closing current env to prevent
@@ -1110,14 +1208,14 @@ def eval_policy_all(
             with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
                 fut2meta = {}
                 for task_group, task_id, env in tasks:
-                    fut = executor.submit(task_runner, task_group, task_id, env)
+                    fut = executor.submit(_run_task_with_optional_control, task_group, task_id, env)
                     fut2meta[fut] = (task_group, task_id, env)
                 for fut in cf.as_completed(fut2meta):
                     tg, tid, env = fut2meta[fut]
                     try:
-                        tg, tid, metrics = fut.result()
-                        _accumulate_to(tg, metrics)
-                        per_task_infos.append(_task_info(tg, tid, metrics))
+                        tg, tid, metrics, ctrl_metrics = fut.result()
+                        _accumulate_to(tg, metrics, ctrl_metrics)
+                        per_task_infos.append(_task_info(tg, tid, metrics, ctrl_metrics))
                     finally:
                         env.close()
     finally:
@@ -1134,7 +1232,7 @@ def eval_policy_all(
     groups_aggregated = {}
     for group, acc in group_acc.items():
         group_success = success_summary(acc["successes"])
-        groups_aggregated[group] = {
+        group_entry: dict[str, Any] = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
@@ -1144,10 +1242,13 @@ def eval_policy_all(
             "video_paths": list(acc["video_paths"]),
             "predicted_video_paths": list(acc["predicted_video_paths"]),
         }
+        if run_control:
+            group_entry.update(_control_comparison_summary(acc["successes"], group_ctrl_successes[group]))
+        groups_aggregated[group] = group_entry
 
     # overall aggregates
     overall_success = success_summary(overall["successes"])
-    overall_agg = {
+    overall_agg: dict[str, Any] = {
         "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
         "avg_max_reward": _agg_from_list(overall["max_rewards"]),
         "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
@@ -1159,6 +1260,8 @@ def eval_policy_all(
         "video_paths": list(overall["video_paths"]),
         "predicted_video_paths": list(overall["predicted_video_paths"]),
     }
+    if run_control:
+        overall_agg.update(_control_comparison_summary(overall["successes"], overall_ctrl_successes))
 
     return {
         "per_task": per_task_infos,

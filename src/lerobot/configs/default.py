@@ -120,6 +120,8 @@ class EvalConfig:
     recording_repo_id: str | None = None
     # Whether the pushed recording repositories should be private.
     recording_private: bool = False
+    # Whether to run a matched-seed unperturbed control pass alongside the main evaluation.
+    run_control: bool = False
 
     def __post_init__(self) -> None:
         if self.recording_repo_id is not None and not self.recording:
